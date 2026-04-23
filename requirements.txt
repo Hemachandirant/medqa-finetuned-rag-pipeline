@@ -12,13 +12,8 @@ langchain-text-splitters>=0.2.0
 chromadb>=0.5.0
 langchain-openai
 
-# ─────────────────────────────────────────────
-# Embeddings (BioBERT — medical domain)
-# ─────────────────────────────────────────────
-sentence-transformers>=3.0.0
-transformers>=4.40.0
-torch>=2.1.0                  # CPU only — embeddings only, LLM is on SageMaker
-
+langchain-pinecone
+pinecone-client
 # ─────────────────────────────────────────────
 # AWS SageMaker (LLM inference)
 # ─────────────────────────────────────────────
