@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: medqa-rag-api
+    runtime: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: HF_TOKEN
+        sync: false
+      - key: AWS_REGION
+        value: ap-south-1
+      - key: ENDPOINT_NAME
+        value: medqa-deepseek-v2
+      - key: IAM_ROLE_ARN
+        sync: false
+      - key: AZURE_ENDPOINT
+        sync: false
+      - key: AZURE_API_KEY
+        sync: false
+      - key: AZURE_API_VERSION
+        value: "2024-02-01"
+      - key: AZURE_DEPLOYMENT
+        value: text-embedding-3-small
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: PINECONE_INDEX_NAME
+        value: medqa-textbooks
+      - key: PINECONE_CLOUD
+        value: aws
+      - key: PINECONE_REGION
+        value: us-east-1
+    healthCheckPath: /health
+    memoryMB: 4096
+    maxScaleConcurrency: 10
+    previewPlan: free
