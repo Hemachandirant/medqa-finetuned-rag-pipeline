@@ -1,341 +1,363 @@
 """
-RAGAs Evaluation Suite — Medical RAG Pipeline
-==============================================
-Metrics selected:
-  1. Faithfulness          — Hallucination guard (critical for clinical safety)
-  2. Answer Relevancy      — Measures if answer actually addresses the question
-  3. Context Precision     — Are retrieved chunks genuinely useful? (cost of noise)
-  4. Context Recall        — Did we retrieve all necessary medical evidence?
-  5. Answer Correctness    — End-to-end factual accuracy vs. ground truth
+RAGAs Evaluation Suite — MedQA DeepSeek RAG Pipeline
+======================================================
+Uses the vibrantlabsai/ragas v0.4 API (SingleTurnSample + single_turn_ascore).
 
-See README.md for full rationale.
+Install:
+  pip install git+https://github.com/vibrantlabsai/ragas
+
+Metrics:
+  1. Faithfulness                        — Is the answer grounded in the retrieved context?
+  2. ResponseRelevancy                   — Does the answer address the question?
+  3. LLMContextPrecisionWithoutReference — Are retrieved chunks relevant?
+  4. LLMContextRecall                    — Does context cover the ground truth answer?
+
+Usage:
+  python ragas_eval.py                          # Full eval on built-in test set
+  python ragas_eval.py --questions custom.json  # Custom questions file
+  python ragas_eval.py --output results.json    # Save results to file
+  python ragas_eval.py --sample 3               # Quick test on first N questions
 """
 
+import os
 import json
+import asyncio
+import argparse
 import time
 from pathlib import Path
-from typing import List, Dict, Optional
-from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from typing import List, Dict
+from dotenv import load_dotenv
 
-from datasets import Dataset
-from ragas import evaluate
+load_dotenv(Path(__file__).parent / ".env")
+
+# ── RAGAs v0.4 imports ────────────────────────────────────────────────────────
+from ragas import SingleTurnSample
 from ragas.metrics import (
-    faithfulness,
-    answer_relevancy,
-    context_precision,
-    context_recall,
-    answer_correctness,
+    Faithfulness,
+    ResponseRelevancy,
+    LLMContextPrecisionWithoutReference,
+    LLMContextRecall,
 )
-from ragas.metrics.critique import harmfulness   # Safety metric — important for medical domain
-import pandas as pd
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
+
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+
+# ── Pipeline ──────────────────────────────────────────────────────────────────
+from rag_pipeline import build_pipeline, MedicalRAGPipeline, SAGEMAKER_ENDPOINT, AWS_REGION
 
 
 # ─────────────────────────────────────────────
-# Medical Ground Truth Test Cases
+# Judge LLM — Azure OpenAI
+# RAGAs needs a capable judge. The fine-tuned
+# 1.5B SageMaker model cannot follow RAGAs'
+# structured scoring prompts reliably.
 # ─────────────────────────────────────────────
 
-MEDICAL_TEST_CASES = [
-    # ── Factual ──────────────────────────────────────────────────────────────
+def get_judge_llm() -> LangchainLLMWrapper:
+    return LangchainLLMWrapper(AzureChatOpenAI(
+        azure_endpoint=os.getenv("AZURE_ENDPOINT", ""),
+        azure_deployment=os.getenv("AZURE_CHAT_DEPLOYMENT", "gpt-4o"),
+        api_key=os.getenv("AZURE_API_KEY", ""),
+        api_version=os.getenv("AZURE_API_VERSION", "2024-02-01"),
+        temperature=0.0,
+    ))
+
+
+def get_judge_embeddings() -> LangchainEmbeddingsWrapper:
+    return LangchainEmbeddingsWrapper(AzureOpenAIEmbeddings(
+        azure_endpoint=os.getenv("AZURE_ENDPOINT", ""),
+        azure_deployment=os.getenv("AZURE_DEPLOYMENT", "text-embedding-3-small"),
+        api_key=os.getenv("AZURE_API_KEY", ""),
+        api_version=os.getenv("AZURE_API_VERSION", "2024-02-01"),
+        chunk_size=10,
+    ))
+
+
+# ─────────────────────────────────────────────
+# Built-in Medical Test Set
+# Covers all 5 query types + diverse topics
+# ─────────────────────────────────────────────
+
+MEDICAL_TEST_SET = [
+    # ── FACTUAL ──────────────────────────────
     {
-        "question": "What is the normal fasting blood glucose range in adults?",
-        "ground_truth": (
-            "Normal fasting blood glucose in adults is 70–99 mg/dL (3.9–5.5 mmol/L). "
-            "Values between 100–125 mg/dL indicate impaired fasting glucose (prediabetes). "
-            "A value ≥126 mg/dL on two occasions is diagnostic of diabetes mellitus."
-        ),
-        "category": "factual",
+        "question": "What is the normal range of HbA1c for a diabetic patient under control?",
+        "ground_truth": "HbA1c below 7% is considered good glycemic control for most diabetic patients according to ADA guidelines.",
+        "query_type": "factual",
     },
     {
-        "question": "What are the diagnostic criteria for hypertension?",
-        "ground_truth": (
-            "Hypertension is diagnosed when systolic blood pressure is ≥130 mmHg and/or "
-            "diastolic blood pressure is ≥80 mmHg (ACC/AHA 2017 guidelines) confirmed on "
-            "two or more occasions. Stage 1: 130–139/80–89 mmHg. Stage 2: ≥140/≥90 mmHg."
-        ),
-        "category": "factual",
-    },
-    # ── Diagnostic ───────────────────────────────────────────────────────────
-    {
-        "question": "What are the differential diagnoses for acute chest pain?",
-        "ground_truth": (
-            "Differential diagnoses for acute chest pain include cardiac causes (ACS, STEMI, "
-            "unstable angina, pericarditis, myocarditis), pulmonary causes (pulmonary embolism, "
-            "pneumothorax, pneumonia, pleuritis), gastrointestinal causes (GERD, esophageal spasm, "
-            "peptic ulcer), musculoskeletal (costochondritis, rib fracture), and aortic dissection. "
-            "Life-threatening causes must be excluded first."
-        ),
-        "category": "diagnostic",
+        "question": "What is metformin and how does it work?",
+        "ground_truth": "Metformin is a biguanide that reduces hepatic glucose production and improves peripheral glucose utilization by activating AMP-dependent protein kinase.",
+        "query_type": "factual",
     },
     {
-        "question": "What is the clinical presentation of diabetic ketoacidosis?",
-        "ground_truth": (
-            "DKA presents with polyuria, polydipsia, vomiting, abdominal pain, and Kussmaul "
-            "breathing (deep rapid respirations). Lab findings include blood glucose >250 mg/dL, "
-            "metabolic acidosis (pH <7.3), elevated anion gap, ketonemia and ketonuria. "
-            "Altered consciousness may occur in severe cases."
-        ),
-        "category": "diagnostic",
+        "question": "What is the definition of type 2 diabetes mellitus?",
+        "ground_truth": "Type 2 diabetes mellitus is a progressive metabolic disorder characterized by insulin resistance and relative insulin deficiency, leading to chronic hyperglycemia.",
+        "query_type": "factual",
     },
-    # ── Procedural ───────────────────────────────────────────────────────────
+    # ── PROCEDURAL ───────────────────────────
     {
-        "question": "How is a lumbar puncture performed and what are its contraindications?",
-        "ground_truth": (
-            "Lumbar puncture is performed with the patient in lateral decubitus or seated position. "
-            "The needle is inserted between L3-L4 or L4-L5 into the subarachnoid space. "
-            "Contraindications include raised intracranial pressure (risk of herniation), coagulopathy "
-            "(INR >1.5, platelets <50,000), local skin infection at the puncture site, and suspected "
-            "spinal cord compression. CT head should precede LP if focal neurological signs are present."
-        ),
-        "category": "procedural",
+        "question": "How is insulin therapy initiated in type 2 diabetes?",
+        "ground_truth": "Insulin therapy in type 2 diabetes is typically initiated with basal insulin such as glargine or detemir, titrated based on fasting glucose levels, and combined with oral agents if needed.",
+        "query_type": "procedural",
     },
-    # ── Comparative ──────────────────────────────────────────────────────────
     {
-        "question": "Compare ACE inhibitors and ARBs in the treatment of heart failure.",
-        "ground_truth": (
-            "Both ACE inhibitors and ARBs reduce mortality in heart failure with reduced ejection "
-            "fraction (HFrEF). ACE inhibitors (e.g., enalapril, ramipril) block conversion of "
-            "angiotensin I to II; ARBs (e.g., losartan, valsartan) block the AT1 receptor. "
-            "ACE inhibitors are first-line; ARBs are preferred when ACE inhibitor cough (bradykinin-mediated) "
-            "occurs. Both are contraindicated in pregnancy and bilateral renal artery stenosis. "
-            "Combination is generally avoided due to risk of hyperkalemia and renal impairment."
-        ),
-        "category": "comparative",
+        "question": "How do you perform a diagnostic workup for suspected hypothyroidism?",
+        "ground_truth": "Hypothyroidism workup begins with serum TSH measurement. Elevated TSH with low free T4 confirms primary hypothyroidism. Anti-TPO antibodies confirm autoimmune Hashimoto's thyroiditis.",
+        "query_type": "procedural",
     },
-    # ── Multi-hop ────────────────────────────────────────────────────────────
+    # ── DIAGNOSTIC ───────────────────────────
     {
-        "question": "How does chronic kidney disease affect the dosing of metformin?",
-        "ground_truth": (
-            "Metformin is renally cleared and accumulates in CKD, increasing risk of lactic acidosis. "
-            "It is generally safe in CKD stage G1-G3a (eGFR ≥45 mL/min/1.73m²). Dose reduction and "
-            "close monitoring is recommended for eGFR 30–44. Metformin should be withheld when eGFR "
-            "falls below 30 mL/min/1.73m². It should also be temporarily held before contrast "
-            "procedures in patients with CKD."
-        ),
-        "category": "multi_hop",
+        "question": "What are the symptoms and diagnostic criteria for diabetic ketoacidosis?",
+        "ground_truth": "DKA presents with polyuria, polydipsia, nausea, vomiting, and abdominal pain. Criteria: glucose >250 mg/dL, pH <7.3, bicarbonate <18, and positive ketones.",
+        "query_type": "diagnostic",
     },
-    # ── Safety / Pharmacology ─────────────────────────────────────────────────
     {
-        "question": "What are the signs and management of anaphylaxis?",
-        "ground_truth": (
-            "Anaphylaxis presents with urticaria, angioedema, bronchospasm, hypotension, and "
-            "tachycardia within minutes of allergen exposure. Management: (1) Intramuscular "
-            "epinephrine 0.3–0.5 mg (1:1000) into anterolateral thigh — first-line treatment. "
-            "(2) Position supine, elevate legs. (3) IV fluids, oxygen. (4) Antihistamines and "
-            "corticosteroids are adjunctive only. Patient should be observed for biphasic reaction."
-        ),
-        "category": "procedural",
+        "question": "What are the differential diagnoses for chest pain with dyspnea?",
+        "ground_truth": "Differentials include acute MI, pulmonary embolism, pneumothorax, aortic dissection, pericarditis. ECG, troponin, D-dimer, and chest X-ray guide workup.",
+        "query_type": "diagnostic",
+    },
+    {
+        "question": "How do you diagnose chronic kidney disease?",
+        "ground_truth": "CKD is diagnosed by persistent GFR below 60 mL/min/1.73m² or markers of kidney damage such as albuminuria for more than 3 months.",
+        "query_type": "diagnostic",
+    },
+    # ── COMPARATIVE ──────────────────────────
+    {
+        "question": "Compare GLP-1 receptor agonists and SGLT2 inhibitors in type 2 diabetes.",
+        "ground_truth": "GLP-1 agonists promote insulin secretion and reduce appetite causing weight loss. SGLT2 inhibitors reduce renal glucose reabsorption and have proven heart failure and renal protective benefits.",
+        "query_type": "comparative",
+    },
+    {
+        "question": "What is the difference between type 1 and type 2 diabetes mellitus?",
+        "ground_truth": "Type 1 DM is autoimmune beta-cell destruction causing absolute insulin deficiency requiring insulin. Type 2 involves insulin resistance managed initially with lifestyle changes and oral agents.",
+        "query_type": "comparative",
+    },
+    # ── MULTI-HOP ────────────────────────────
+    {
+        "question": "How does obesity affect insulin resistance and cardiovascular risk?",
+        "ground_truth": "Obesity causes adipose dysfunction with elevated free fatty acids and cytokines impairing insulin signaling, promoting dyslipidemia, hypertension, and atherosclerosis.",
+        "query_type": "multi_hop",
+    },
+    {
+        "question": "What is the relationship between hypertension and chronic kidney disease progression?",
+        "ground_truth": "Hypertension accelerates CKD by increasing glomerular pressure causing nephrosclerosis. ACE inhibitors and ARBs reduce proteinuria and slow CKD progression.",
+        "query_type": "multi_hop",
     },
 ]
 
 
 # ─────────────────────────────────────────────
-# Evaluation Runner
+# Run pipeline on test set
 # ─────────────────────────────────────────────
 
-@dataclass
-class EvalResult:
-    timestamp:          str
-    num_test_cases:     int
-    metrics:            Dict[str, float]
-    per_case_results:   List[Dict]
-    summary:            Dict[str, str] = field(default_factory=dict)
-
-
-def run_ragas_evaluation(
-    rag_pipeline,
-    test_cases: List[Dict] = MEDICAL_TEST_CASES,
-    output_dir: str = "./eval_results",
-) -> EvalResult:
-    """
-    Run RAGAs evaluation across all test cases.
-
-    Metrics selected and rationale:
-    ─────────────────────────────────
-    1. Faithfulness (Weight: HIGH — Patient Safety)
-       Measures whether every statement in the answer is grounded in the
-       retrieved context. In medical QA, an unfounded claim can cause direct harm.
-       Target: >0.85
-
-    2. Answer Relevancy (Weight: HIGH — Usability)
-       Measures whether the answer addresses the actual question asked, not just
-       topically related content. A doctor asking about dosing needs dosing info,
-       not disease background. Target: >0.80
-
-    3. Context Precision (Weight: MEDIUM — Retrieval Quality)
-       Measures the fraction of retrieved chunks that are genuinely useful.
-       High noise in context leads to distracted generation and longer latency.
-       Target: >0.70
-
-    4. Context Recall (Weight: MEDIUM — Evidence Completeness)
-       Measures whether retrieved chunks collectively cover the ground truth.
-       For multi-step clinical decisions, missing one evidence chunk can lead
-       to incomplete treatment plans. Target: >0.65
-
-    5. Answer Correctness (Weight: HIGH — Factual Accuracy)
-       End-to-end factual match against ground truth. Combines semantic
-       similarity + factual overlap. Primary metric for clinical trustworthiness.
-       Target: >0.75
-
-    6. Harmfulness (Weight: HIGH — Safety)
-       Detects potentially harmful medical advice. Critical guard for patient
-       safety. Any response scoring >0.1 should be reviewed. Target: <0.10
-    """
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    questions, answers, contexts, ground_truths = [], [], [], []
+def run_pipeline_on_testset(
+    pipeline: MedicalRAGPipeline,
+    test_set: List[Dict],
+) -> List[Dict]:
+    results = []
 
     print(f"\n{'='*60}")
-    print(f"Running RAGAs evaluation on {len(test_cases)} medical test cases...")
+    print(f"Running pipeline on {len(test_set)} questions...")
     print(f"{'='*60}\n")
 
-    for i, case in enumerate(test_cases, 1):
-        print(f"[{i}/{len(test_cases)}] {case['category'].upper()}: {case['question'][:60]}...")
+    for i, item in enumerate(test_set, 1):
+        q = item["question"]
+        print(f"[{i}/{len(test_set)}] {q[:75]}...")
+
+        t0 = time.time()
         try:
-            result = rag_pipeline.run(case["question"])
-            questions.append(case["question"])
-            answers.append(result["answer"])
-            contexts.append([doc.page_content for doc in result["source_docs"]])
-            ground_truths.append(case["ground_truth"])
+            result  = pipeline.run(q)
+            elapsed = round(time.time() - t0, 1)
+
+            # Strip "--- Sources ---" section — RAGAs needs clean LLM answer only
+            clean_answer = result["answer"].split("--- Sources ---")[0].strip()
+
+            results.append({
+                "question":     q,
+                "answer":       clean_answer,
+                "contexts":     [doc.page_content for doc in result["source_docs"]],
+                "ground_truth": item["ground_truth"],
+                "query_type":   item.get("query_type", "unknown"),
+            })
+            print(f"    ✅ {elapsed}s | docs={result['num_docs']} | type={result['query_type']}")
+
         except Exception as e:
-            print(f"  ⚠ Error: {e}")
-            questions.append(case["question"])
-            answers.append("Error generating answer.")
-            contexts.append(["No context retrieved."])
-            ground_truths.append(case["ground_truth"])
+            print(f"    ❌ Failed: {e}")
+            results.append({
+                "question":     q,
+                "answer":       "Error: pipeline failed",
+                "contexts":     [""],
+                "ground_truth": item["ground_truth"],
+                "query_type":   item.get("query_type", "unknown"),
+            })
 
-    # Build RAGAs dataset
-    eval_dataset = Dataset.from_dict({
-        "question":    questions,
-        "answer":      answers,
-        "contexts":    contexts,
-        "ground_truth": ground_truths,
-    })
+    return results
 
-    # Run evaluation
-    print("\n[RAGAs] Computing metrics...")
-    metrics = [
-        faithfulness,
-        answer_relevancy,
-        context_precision,
-        context_recall,
-        answer_correctness,
-        harmfulness,
-    ]
-    scores = evaluate(eval_dataset, metrics=metrics)
 
-    # Build per-case results
-    scores_df = scores.to_pandas()
-    per_case  = []
-    for i, case in enumerate(test_cases):
-        row = {"question": case["question"], "category": case["category"], "answer": answers[i]}
-        for col in scores_df.columns:
-            if col not in ("question", "answer", "contexts", "ground_truth"):
-                row[col] = round(float(scores_df[col].iloc[i]), 4)
-        per_case.append(row)
+# ─────────────────────────────────────────────
+# RAGAs v0.4 scoring — per sample
+# ─────────────────────────────────────────────
 
-    # Aggregate metrics
-    agg_metrics = {
-        col: round(float(scores_df[col].mean()), 4)
-        for col in scores_df.columns
-        if col not in ("question", "answer", "contexts", "ground_truth")
-    }
-
-    # Build summary with pass/fail against targets
-    targets = {
-        "faithfulness":       0.85,
-        "answer_relevancy":   0.80,
-        "context_precision":  0.70,
-        "context_recall":     0.65,
-        "answer_correctness": 0.75,
-        "harmfulness":        0.10,  # Lower is better
-    }
-    summary = {}
-    for metric, target in targets.items():
-        if metric not in agg_metrics:
-            continue
-        val = agg_metrics[metric]
-        if metric == "harmfulness":
-            status = "✅ PASS" if val <= target else "❌ FAIL"
-        else:
-            status = "✅ PASS" if val >= target else "❌ FAIL"
-        summary[metric] = f"{val:.4f} (target {'≤' if metric=='harmfulness' else '≥'}{target}) — {status}"
-
-    result_obj = EvalResult(
-        timestamp=datetime.now().isoformat(),
-        num_test_cases=len(test_cases),
-        metrics=agg_metrics,
-        per_case_results=per_case,
-        summary=summary,
+async def score_sample(item: Dict, metrics: Dict) -> Dict:
+    """Score a single item across all 4 metrics using v0.4 API."""
+    sample = SingleTurnSample(
+        user_input=item["question"],
+        response=item["answer"],
+        retrieved_contexts=item["contexts"],
+        reference=item["ground_truth"],
     )
 
-    # Save results
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    json_path = f"{output_dir}/ragas_results_{ts}.json"
-    with open(json_path, "w") as f:
-        json.dump(asdict(result_obj), f, indent=2)
+    scores = {}
+    for name, metric in metrics.items():
+        try:
+            result      = await metric.single_turn_ascore(sample)
+            scores[name] = round(float(result), 4) if result is not None else None
+        except Exception as e:
+            print(f"    ⚠️  {name} failed: {e}")
+            scores[name] = None
 
-    csv_path = f"{output_dir}/ragas_results_{ts}.csv"
-    scores_df.to_csv(csv_path, index=False)
+    return scores
 
-    # Print report
+
+async def run_ragas_evaluation(pipeline_results: List[Dict]) -> List[Dict]:
     print(f"\n{'='*60}")
-    print("  RAGAs Evaluation Report — Medical RAG Pipeline")
-    print(f"{'='*60}")
-    print(f"  Timestamp : {result_obj.timestamp}")
-    print(f"  Test Cases: {result_obj.num_test_cases}")
-    print(f"\n  Metric Summary:")
-    for metric, status in summary.items():
-        print(f"    {metric:<25} {status}")
-    print(f"\n  Results saved → {json_path}")
-    print(f"  CSV saved    → {csv_path}")
+    print("Running RAGAs evaluation (vibrantlabsai/ragas v0.4)...")
     print(f"{'='*60}\n")
 
-    return result_obj
+    judge_llm        = get_judge_llm()
+    judge_embeddings = get_judge_embeddings()
+
+    metrics = {
+        "faithfulness":      Faithfulness(llm=judge_llm),
+        "response_relevancy": ResponseRelevancy(llm=judge_llm, embeddings=judge_embeddings),
+        "context_precision": LLMContextPrecisionWithoutReference(llm=judge_llm),
+        "context_recall":    LLMContextRecall(llm=judge_llm),
+    }
+
+    scored = []
+    for i, item in enumerate(pipeline_results, 1):
+        print(f"[{i}/{len(pipeline_results)}] Scoring: {item['question'][:60]}...")
+        scores = await score_sample(item, metrics)
+        scored.append({**item, **scores})
+        print(f"    faith={scores.get('faithfulness')} | "
+              f"rel={scores.get('response_relevancy')} | "
+              f"prec={scores.get('context_precision')} | "
+              f"rec={scores.get('context_recall')}")
+
+    return scored
 
 
 # ─────────────────────────────────────────────
-# Category-level breakdown
+# Results Formatter
 # ─────────────────────────────────────────────
 
-def category_report(result: EvalResult) -> pd.DataFrame:
-    """Break down metrics by query category."""
-    df = pd.DataFrame(result.per_case_results)
-    numeric_cols = [c for c in df.columns if c not in ("question", "answer", "category")]
-    return df.groupby("category")[numeric_cols].mean().round(4)
+METRICS = ["faithfulness", "response_relevancy", "context_precision", "context_recall"]
+
+
+def safe_avg(values):
+    clean = [v for v in values if v is not None]
+    return round(sum(clean) / len(clean), 4) if clean else None
+
+
+def print_results(scored: List[Dict]):
+    print(f"\n{'='*60}")
+    print("RAGAs Evaluation Results")
+    print(f"{'='*60}\n")
+
+    print("Overall Scores:")
+    print("-" * 45)
+    for m in METRICS:
+        avg = safe_avg([r.get(m) for r in scored])
+        if avg is not None:
+            bar  = "█" * int(avg * 20)
+            flag = "✅" if avg >= 0.7 else ("⚠️ " if avg >= 0.4 else "❌")
+            print(f"  {flag} {m:<30} {avg:.3f}  {bar}")
+
+    print(f"\n{'='*60}")
+    print("Per-Question Breakdown:")
+    print("-" * 60)
+    for i, r in enumerate(scored, 1):
+        print(f"\n[Q{i}] ({r['query_type']}) {r['question'][:65]}...")
+        for m in METRICS:
+            val  = r.get(m)
+            disp = f"{val:.3f}" if val is not None else "n/a"
+            flag = ("✅" if val >= 0.7 else ("⚠️ " if val >= 0.4 else "❌")) if val is not None else "⚠️ "
+            print(f"    {flag} {m:<30} {disp}")
+
+    print(f"\n{'='*60}")
+    print("Scores by Query Type:")
+    print("-" * 45)
+    for qt in sorted(set(r["query_type"] for r in scored)):
+        subset = [r for r in scored if r["query_type"] == qt]
+        parts  = [f"{m[:6]}: {safe_avg([r.get(m) for r in subset])}" for m in METRICS]
+        print(f"  {qt:<14} {' | '.join(parts)}")
+
+    ranked = sorted([r for r in scored if r.get("faithfulness") is not None],
+                    key=lambda x: x["faithfulness"])
+    if ranked:
+        print(f"\n{'='*60}")
+        print("Lowest Faithfulness (top 3 to review):")
+        print("-" * 45)
+        for r in ranked[:3]:
+            print(f"  [{scored.index(r)+1}] {r['question'][:65]}...")
+            print(f"       faithfulness={r['faithfulness']}")
+
+    print(f"\n{'='*60}\n")
 
 
 # ─────────────────────────────────────────────
-# Quick smoke test (no live pipeline needed)
+# Save Results
 # ─────────────────────────────────────────────
 
-def smoke_test_metrics():
-    """Validate that RAGAs metrics load and run on synthetic data."""
-    print("[Smoke Test] Validating RAGAs metric imports...")
-    dummy = Dataset.from_dict({
-        "question":    ["What is aspirin used for?"],
-        "answer":      ["Aspirin is used as an analgesic and antiplatelet agent."],
-        "contexts":    [["Aspirin inhibits COX-1 and COX-2, reducing prostaglandin synthesis."]],
-        "ground_truth":["Aspirin is used for pain relief and prevention of platelet aggregation."],
-    })
-    result = evaluate(dummy, metrics=[faithfulness, answer_relevancy])
-    print(f"[Smoke Test] ✅ Metrics functional: {dict(result)}")
-    return result
+def save_results(scored: List[Dict], output_path: str):
+    output = {
+        "summary":       {m: safe_avg([r.get(m) for r in scored]) for m in METRICS},
+        "num_questions": len(scored),
+        "results":       scored,
+    }
+    with open(output_path, "w") as f:
+        json.dump(output, f, indent=2, default=str)
+    print(f"[Eval] Results saved → {output_path}")
+
+
+# ─────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="RAGAs v0.4 Evaluation — MedQA RAG Pipeline")
+    parser.add_argument("--questions", type=str, default=None,
+        help="Path to custom questions JSON [{question, ground_truth, query_type}]")
+    parser.add_argument("--output",    type=str, default="ragas_results.json")
+    parser.add_argument("--sample",    type=int, default=None,
+        help="Only run on the first N questions (quick test)")
+    parser.add_argument("--endpoint",  type=str, default=None,
+        help="Override SageMaker endpoint name")
+    args = parser.parse_args()
+
+    if args.questions:
+        with open(args.questions) as f:
+            test_set = json.load(f)
+        print(f"[Eval] Loaded {len(test_set)} questions from {args.questions}")
+    else:
+        test_set = MEDICAL_TEST_SET
+        print(f"[Eval] Using built-in test set ({len(test_set)} questions)")
+
+    if args.sample:
+        test_set = test_set[:args.sample]
+        print(f"[Eval] Sampling first {args.sample} questions")
+
+    endpoint = args.endpoint or SAGEMAKER_ENDPOINT
+    pipeline = build_pipeline(endpoint=endpoint, region=AWS_REGION)
+
+    pipeline_results = run_pipeline_on_testset(pipeline, test_set)
+    scored           = asyncio.run(run_ragas_evaluation(pipeline_results))
+
+    print_results(scored)
+    save_results(scored, args.output)
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="RAGAs Evaluation for Medical RAG")
-    parser.add_argument("--smoke",   action="store_true", help="Run smoke test only")
-    parser.add_argument("--model",   type=str, default=None, help="HF model repo")
-    parser.add_argument("--rebuild", action="store_true")
-    args = parser.parse_args()
-
-    if args.smoke:
-        smoke_test_metrics()
-    else:
-        from rag_pipeline import build_pipeline, HF_MODEL_REPO
-        model = args.model or HF_MODEL_REPO
-        pipeline_obj = build_pipeline(model_repo=model, rebuild_index=args.rebuild)
-        run_ragas_evaluation(pipeline_obj)
+    main()

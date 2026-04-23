@@ -85,7 +85,7 @@ def load_vectorstore() -> PineconeVectorStore:
         index_name=PINECONE_INDEX_NAME,
         embedding=embeddings,
     )
-    print(f"[Pinecone]  Connected.")
+    print(f"[Pinecone] ✅ Connected.")
     return vectorstore
 
 
@@ -133,7 +133,7 @@ class SageMakerLLM(BaseLLM):
             "inputs": formatted,
             "parameters": {
                 "max_new_tokens":     self.max_new_tokens,
-                "temperature":        0.6,   # R1 models work better at 0.6
+                "temperature":        0.2,   # Low temperature for factual medical QA
                 "top_p":              0.95,
                 "repetition_penalty": 1.05,
                 "do_sample":          True,
@@ -166,7 +166,6 @@ class SageMakerLLM(BaseLLM):
         """
         Injects an answer prefix directly into the assistant turn.
         Forces the model to continue the prefix instead of starting fresh.
-        This is the key trick to get detailed answers from small fine-tuned models.
         """
         runtime = boto3.client(
             "sagemaker-runtime",
@@ -175,7 +174,6 @@ class SageMakerLLM(BaseLLM):
             aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
         )
 
-        # Inject prefix into assistant turn so model must continue it
         formatted = (
             f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
             f"<|im_start|>user\n{user_message}\n"
@@ -187,7 +185,7 @@ class SageMakerLLM(BaseLLM):
             "inputs": formatted,
             "parameters": {
                 "max_new_tokens":     self.max_new_tokens,
-                "temperature":        0.6,
+                "temperature":        0.2,   # Low temperature for factual medical QA
                 "top_p":              0.95,
                 "repetition_penalty": 1.05,
                 "do_sample":          True,
@@ -247,7 +245,7 @@ def classify_query(query: str) -> QueryType:
 
 def get_retrieval_config(query_type: QueryType) -> Dict:
     configs = {
-        QueryType.FACTUAL:     {"k": 3,  "use_mmr": False, "expand_query": False},
+        QueryType.FACTUAL:     {"k": 5,  "use_mmr": False, "expand_query": False},
         QueryType.PROCEDURAL:  {"k": 5,  "use_mmr": True,  "expand_query": False},
         QueryType.DIAGNOSTIC:  {"k": 7,  "use_mmr": True,  "expand_query": True},
         QueryType.COMPARATIVE: {"k": 8,  "use_mmr": True,  "expand_query": True},
@@ -259,15 +257,6 @@ def get_retrieval_config(query_type: QueryType) -> Dict:
 # ─────────────────────────────────────────────
 # Query Expansion
 # ─────────────────────────────────────────────
-
-EXPANSION_PROMPT = PromptTemplate.from_template(
-    """Generate 3 alternative medical search queries for better document retrieval.
-Return only the queries, one per line, no numbering.
-
-Original query: {query}
-Alternative queries:"""
-)
-
 
 def expand_medical_query(query: str, llm: SageMakerLLM) -> List[str]:
     message = (
@@ -284,18 +273,6 @@ def expand_medical_query(query: str, llm: SageMakerLLM) -> List[str]:
 # ─────────────────────────────────────────────
 # Corrective RAG — Relevance Grader
 # ─────────────────────────────────────────────
-
-GRADER_PROMPT = PromptTemplate.from_template(
-    """Is this document relevant to the medical question? Answer with a score between 0.0 and 1.0.
-A score above 0.3 means the document contains useful information about the topic.
-
-Question: {question}
-Document excerpt: {document}
-
-Reply in this exact format only:
-score: <number between 0.0 and 1.0>"""
-)
-
 
 def grade_documents(
     query: str,
@@ -326,20 +303,8 @@ def grade_documents(
 
 
 # ─────────────────────────────────────────────
-# RAG Prompt
+# Helpers
 # ─────────────────────────────────────────────
-
-MEDICAL_RAG_PROMPT = PromptTemplate.from_template(
-    """Use the following medical textbook excerpts to answer the question.
-Explain in detail: include drug names, mechanisms, and clinical reasoning.
-
-Context:
-{context}
-
-Question: {question}
-Explain in detail."""
-)
-
 
 def format_docs(docs: List[Document]) -> str:
     sections = []
@@ -348,6 +313,16 @@ def format_docs(docs: List[Document]) -> str:
         score = doc.metadata.get("relevance_score", "N/A")
         sections.append(f"[Source {i} | {book} | relevance={score}]\n{doc.page_content}")
     return "\n\n---\n\n".join(sections)
+
+
+def clean_book_name(doc: Document) -> str:
+    book = (
+        doc.metadata.get("book") or
+        doc.metadata.get("source", "") or
+        "Medical Textbook"
+    )
+    book = re.split(r"[/\\]", book)[-1].replace(".txt", "")
+    return book
 
 
 # ─────────────────────────────────────────────
@@ -364,9 +339,9 @@ class MedicalRAGPipeline:
             retriever = self.vectorstore.as_retriever(
                 search_type="mmr",
                 search_kwargs={
-                    "k":            config["k"],
-                    "fetch_k":      config["k"] * 3,
-                    "lambda_mult":  0.6,
+                    "k":           config["k"],
+                    "fetch_k":     config["k"] * 3,
+                    "lambda_mult": 0.6,
                 },
             )
         else:
@@ -381,7 +356,7 @@ class MedicalRAGPipeline:
         config     = get_retrieval_config(query_type)
         print(f"[Adaptive] Query type: {query_type.value} | k={config['k']} | mmr={config['use_mmr']}")
 
-        # Step 2: Query expansion (only for complex queries — saves LLM round trip)
+        # Step 2: Query expansion (only for complex queries)
         queries = [query]
         if config["expand_query"]:
             try:
@@ -417,48 +392,37 @@ class MedicalRAGPipeline:
             print("[CRAG] Fallback: using top 3 ungraded docs")
             filtered_docs = all_docs[:3]
 
-        # Step 6: Two-stage answer
-        # Stage A: Model identifies the key answer (what it's good at)
-        # Stage B: Retrieved context provides the clinical explanation
-        # This is the correct pattern for small fine-tuned MCQ models
+        # Step 6: LLM answer synthesis from retrieved context
+        MAX_CONTEXT_CHARS = 6000
         context = format_docs(filtered_docs)
+        context = context[:MAX_CONTEXT_CHARS]
 
-        # Build answer entirely from retrieved context — more reliable than
-        # asking a 1.5B MCQ model to synthesize. Model is used for routing
-        # and query expansion; context provides the clinical explanation.
-        best_doc     = max(filtered_docs, key=lambda d: d.metadata.get("relevance_score", 0))
-        source_book  = best_doc.metadata.get("book", "Medical Textbook")
+        prompt = (
+            f"You are a medical expert.\n\n"
+            f"Answer the question using ONLY the context below.\n\n"
+            f"Instructions:\n"
+            f"- Give a clear summary first\n"
+            f"- Then detailed explanation\n"
+            f"- Include treatment steps\n"
+            f"- Mention drug names clearly\n"
+            f"- Do not hallucinate\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question:\n{query}\n\n"
+            f"Answer:"
+        )
 
-        # Extract first clean sentence from Source 1 (best prose, not figure captions)
-        # Pick the doc with the longest clean first sentence (avoids figure captions)
-        def get_first_sentence(doc):
-            text = doc.page_content.strip()
-            sentences = re.split(r"(?<=[.!?])\s+", text)
-            # Skip sentences that look like figure captions or headers
-            for s in sentences:
-                if len(s) > 40 and not s.startswith("FIGURE") and not s.startswith("TABLE"):
-                    return s
-            return sentences[0] if sentences else text[:150]
+        print(f"[LLM] Generating answer from {len(filtered_docs)} docs...")
+        import time
+        start = time.time()
+        llm_answer = self.llm._call(prompt)
+        print(f"[LLM] Time: {round(time.time() - start, 2)}s")
 
-        # Pick best summary sentence across ALL docs (not just highest score)
-        first_sentence = ""
-        for doc in filtered_docs:
-            candidate = get_first_sentence(doc)
-            if len(candidate) > len(first_sentence):
-                first_sentence = candidate
+        # Fallback if model gives a weak/empty answer
+        if len(llm_answer.strip()) < 50:
+            print("[LLM] Weak answer → fallback to raw context")
+            llm_answer = context[:1000]
 
-        def clean_book_name(doc):
-            book = (
-                doc.metadata.get("book") or
-                doc.metadata.get("source", "") or
-                "Medical Textbook"
-            )
-            # Normalize: strip path separators and .txt
-            import re as _re
-            book = _re.split(r"[/\\]", book)[-1].replace(".txt", "")
-            return book
-
-        # Full answer: summary + all source excerpts with real book names
+        # Append source attribution after the LLM answer
         excerpts = []
         for i, doc in enumerate(filtered_docs, 1):
             book  = clean_book_name(doc)
@@ -467,10 +431,7 @@ class MedicalRAGPipeline:
                 f"[Source {i} — {book} | relevance={score}]\n{doc.page_content[:600].strip()}"
             )
 
-        answer = (
-            f"Summary: {first_sentence}\n\n"
-            f"Clinical Detail:\n" + "\n\n".join(excerpts)
-        )
+        answer = llm_answer + "\n\n--- Sources ---\n\n" + "\n\n".join(excerpts)
 
         return {
             "query":       query,
@@ -523,7 +484,6 @@ if __name__ == "__main__":
         print(f"Docs Used  : {result['num_docs']}")
         print(f"\nAnswer:\n{result['answer']}")
     else:
-        # Interactive mode
         print("\nMedical RAG ready. Type your question (or 'quit' to exit):\n")
         while True:
             q = input("Question: ").strip()
