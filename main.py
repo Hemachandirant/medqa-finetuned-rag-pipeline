@@ -82,10 +82,6 @@ class QueryRequest(BaseModel):
         description="The medical question to answer.",
         example="What are the treatment options for Type 2 diabetes?",
     )
-    endpoint: Optional[str] = Field(
-        default=None,
-        description="Override the SageMaker endpoint name (optional).",
-    )
 
 
 class SourceDocument(BaseModel):
