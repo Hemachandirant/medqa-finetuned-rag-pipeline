@@ -39,9 +39,9 @@ pypdf==5.4.0
 # Pinned to vibrantlabsai fork (v0.4 API used in evaluate.py:
 #   SingleTurnSample, single_turn_ascore, LangchainLLMWrapper, LangchainEmbeddingsWrapper)
 # ─────────────────────────────────────────────
-git+https://github.com/vibrantlabsai/ragas
-datasets==3.5.1
-pandas==2.2.3
+# git+https://github.com/vibrantlabsai/ragas
+# datasets==3.5.1
+# pandas==2.2.3
 
 # ─────────────────────────────────────────────
 # API Server (main.py / FastAPI)
