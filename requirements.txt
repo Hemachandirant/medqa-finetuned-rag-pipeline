@@ -1,4 +1,10 @@
 # ─────────────────────────────────────────────
+# Python 3.12 required — pin in render.yaml / .python-version:
+#   python_version: "3.12.10"
+# Most packages in this stack cap at <3.14 or <3.13.
+# ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────
 # Core RAG Framework
 # ─────────────────────────────────────────────
 langchain==0.3.25
@@ -11,7 +17,7 @@ langchain-text-splitters==0.3.8
 # (langchain-openai needed for AzureOpenAIEmbeddings used in rag_pipeline.py + evaluate.py)
 # ─────────────────────────────────────────────
 langchain-openai==0.3.16
-langchain-pinecone==0.2.4
+langchain-pinecone==0.2.0
 pinecone-client==5.0.1
 
 # ─────────────────────────────────────────────
