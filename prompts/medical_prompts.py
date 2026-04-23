@@ -28,53 +28,91 @@ Answer only: medical / non-medical
 """
 
 # The main RAG synthesis prompt
-RAG_PROMPT = """
+RAG_PROMPT_FACTUAL = """
 <context>
 {context}
 </context>
 
-You must answer using ONLY the context.
-
-Step 1: Copy the exact sentence from the context that answers the question.
-Step 2: Then explain it clearly in your own words.
-
-STRICT RULES:
-- Do NOT change biological mechanisms
-- Do NOT introduce new concepts (e.g., receptors, pathways not mentioned)
-- If unsure, return only the extracted sentence
+Answer the question using ONLY the context above.
+- Extract the most relevant sentence(s) directly
+- If the answer is a value or definition, state it plainly
+- Do not add information not present in the context
 
 Question: {query}
 
-Answer format:
+Answer:
+"""
 
-Extracted:
-<exact sentence from context>
+RAG_PROMPT_MECHANISTIC = """
+<context>
+{context}
+</context>
 
-Explanation:
-<your explanation>
+Using ONLY the context above, explain the mechanism in full.
+
+Structure your answer as:
+1. Primary mechanism (molecular/cellular level)
+2. Downstream effects (physiological consequences)
+3. Clinical relevance (what this means for the patient)
+
+After each statement, add a citation like [Source 1] matching the context.
+Do not introduce pathways or receptors not mentioned in the context.
+
+Question: {query}
+
+Answer:
+"""
+
+RAG_PROMPT_DIAGNOSTIC = """
+<context>
+{context}
+</context>
+
+Using ONLY the context above, answer the diagnostic question.
+
+Structure:
+1. Key findings that support the diagnosis
+2. Differentials to consider (only if mentioned in context)
+3. Next diagnostic step
+
+Cite each point as [Source N].
+
+Question: {query}
+
+Answer:
 """
 
 # For Corrective RAG (LLM-based Grading)
 GRADER_PROMPT = """
-Answer ONLY with 'yes' or 'no'.
+Answer ONLY with the single word 'yes' or 'no'. No punctuation, no explanation.
 
-Is the following context relevant to the medical question?
+Example:
+Question: What is the mechanism of metformin?
+Context: Metformin reduces hepatic glucose output by antagonizing glucagon signalling.
+Answer: yes
 
+Now answer:
 Question: {query}
 Context: {context}
-"""
+Answer:"""
 
 # Fallback Prompt (When RAG fails or context is missing)
 FALLBACK_PROMPT = """
-The database does not contain enough information for this query.
+The indexed documents do not contain sufficient information for this query.
 
-Provide a general medical overview of: {query}
+Provide a thorough medical overview of: {query}
 
-Structure:
-1. Definition
+If this is a pharmacology/mechanism question, structure as:
+1. Drug class and primary target
+2. Molecular mechanism of action
+3. Physiological effects
+4. Clinical use and key side effects
+
+If this is a disease/diagnosis question, structure as:
+1. Definition and epidemiology
 2. Clinical Presentation
 3. Diagnosis
 4. Treatment
 
-Note: This is general medical knowledge, not from the indexed documents.
+Clearly state at the end: "This answer is based on general medical knowledge."
 """

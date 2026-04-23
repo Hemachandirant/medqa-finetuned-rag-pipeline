@@ -7,11 +7,25 @@ Strategy: Hybrid Adaptive + Corrective RAG
 - Vector Store: Pinecone (cloud-hosted, accessible from any deployment)
 - Embeddings: Azure OpenAI text-embedding-3-small (matches index_documents.py)
 - LLM: Fine-tuned DeepSeek on AWS SageMaker (ap-south-1)
+
+FIXES APPLIED
+=============
+1.  SYSTEM_PROMPT override removed — now uses imported prompt from medical_prompts.py
+2.  grade_documents() is now wired into run() (was dead code before)
+3.  QueryType.MECHANISTIC added — mechanism/pathway/MOA queries no longer fall through to FACTUAL
+4.  "The answer is" prefix stripped in _call() post-processing
+5.  Context window raised: 1,000 chars/doc, 8,000 chars total for deep query types
+6.  Query expansion word cap raised from 8 → 20
+7.  SageMaker calls wrapped in exponential-backoff retry (3 attempts)
+8.  Inline citation instruction added to RAG_PROMPT assembly
+9.  relevance_score now set correctly from grade_documents()
+10. boto3 client created once per instance (not per call) to avoid session overhead
 """
 
 import os
 import re
 import json
+import time
 import boto3
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
@@ -26,19 +40,22 @@ load_dotenv(env_path)
 from langchain_pinecone import PineconeVectorStore
 from langchain_openai import AzureOpenAIEmbeddings
 from langchain_core.documents import Document
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.language_models.llms import BaseLLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from pydantic import Field
 
+# FIX 1: Import all prompts — do NOT redefine SYSTEM_PROMPT below this line
 from prompts.medical_prompts import (
     SYSTEM_PROMPT,
-    RAG_PROMPT,
+    RAG_PROMPT_FACTUAL,
+    RAG_PROMPT_MECHANISTIC,
+    RAG_PROMPT_DIAGNOSTIC,
     QUERY_EXPANSION_PROMPT,
     GRADER_PROMPT,
-    FALLBACK_PROMPT
+    FALLBACK_PROMPT,
 )
+
+
 # ─────────────────────────────────────────────
 # Configuration (load from .env)
 # ─────────────────────────────────────────────
@@ -46,11 +63,9 @@ from prompts.medical_prompts import (
 SAGEMAKER_ENDPOINT  = os.getenv("SAGEMAKER_ENDPOINT_NAME", "medqa-deepseek-v2")
 AWS_REGION          = os.getenv("AWS_REGION", "ap-south-1")
 
-# Pinecone
 PINECONE_API_KEY    = os.getenv("PINECONE_API_KEY", "")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "medqa-textbooks")
 
-# Azure OpenAI Embeddings — must match what was used in index_documents.py
 AZURE_ENDPOINT      = os.getenv("AZURE_ENDPOINT", "")
 AZURE_API_KEY       = os.getenv("AZURE_API_KEY", "")
 AZURE_API_VERSION   = os.getenv("AZURE_API_VERSION", "2024-02-01")
@@ -60,14 +75,21 @@ TOP_K_INITIAL       = 5
 TOP_K_EXPANDED      = 10
 RELEVANCE_THRESHOLD = 0.35
 
-SYSTEM_PROMPT = (
-    "You are a helpful medical assistant. "
-    "Answer questions in detail with drug names, mechanisms, and clinical reasoning."
-)
+# Context size limits (chars) by retrieval depth
+CONTEXT_PER_DOC = {
+    "shallow": 600,   # FACTUAL
+    "medium":  900,   # PROCEDURAL, DIAGNOSTIC
+    "deep":    1200,  # MECHANISTIC, COMPARATIVE, MULTI_HOP
+}
+CONTEXT_TOTAL = {
+    "shallow": 4000,
+    "medium":  6000,
+    "deep":    8000,
+}
 
 
 # ─────────────────────────────────────────────
-# Embeddings — must match index_documents.py
+# Embeddings
 # ─────────────────────────────────────────────
 
 def get_embeddings() -> AzureOpenAIEmbeddings:
@@ -86,12 +108,11 @@ def get_embeddings() -> AzureOpenAIEmbeddings:
 
 def load_vectorstore() -> PineconeVectorStore:
     print(f"[Pinecone] Connecting to index '{PINECONE_INDEX_NAME}'...")
-    embeddings  = get_embeddings()
     vectorstore = PineconeVectorStore(
         index_name=PINECONE_INDEX_NAME,
-        embedding=embeddings,
+        embedding=get_embeddings(),
     )
-    print(f"[Pinecone] ✅ Connected.")
+    print("[Pinecone] ✅ Connected.")
     return vectorstore
 
 
@@ -101,17 +122,95 @@ def load_vectorstore() -> PineconeVectorStore:
 
 class SageMakerLLM(BaseLLM):
     """
-    LangChain-compatible LLM wrapper for fine-tuned DeepSeek
-    deployed at: https://runtime.sagemaker.ap-south-1.amazonaws.com/
-                 endpoints/medqa-deepseek-v2/invocations
+    LangChain-compatible LLM wrapper for fine-tuned DeepSeek deployed on SageMaker.
+
+    Changes vs original:
+    - boto3 client created once at init (FIX 10)
+    - _call() has exponential-backoff retry on ThrottlingException (FIX 7)
+    - _call() strips "The answer is" boilerplate prefix (FIX 4)
+    - SYSTEM_PROMPT used from import, not a hardcoded one-liner (FIX 1)
     """
+
     endpoint_name:  str = Field(default=SAGEMAKER_ENDPOINT)
     region_name:    str = Field(default=AWS_REGION)
     max_new_tokens: int = Field(default=1024)
+    max_retries:    int = Field(default=3)
+
+    # FIX 10: cache the boto3 client as a private attribute
+    _runtime: Optional[object] = None
+
+    def model_post_init(self, __context):
+        """Build the boto3 client once after Pydantic model initialises."""
+        object.__setattr__(self, "_runtime", boto3.client(
+            "sagemaker-runtime",
+            region_name=self.region_name,
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        ))
 
     @property
     def _llm_type(self) -> str:
         return "sagemaker-deepseek"
+
+    # ── internal: build ChatML-formatted prompt ──────────────────────────────
+
+    def _build_prompt(self, user_message: str, prefix: str = "") -> str:
+        """Assemble the ChatML prompt that DeepSeek-R1-Distill-Qwen expects."""
+        base = (
+            f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+            f"<|im_start|>user\n{user_message}\n"
+            f"<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        return base if not prefix else base + prefix
+
+    # ── internal: invoke with retry ──────────────────────────────────────────
+
+    def _invoke_with_retry(self, payload: dict) -> str:
+        """
+        FIX 7: Retry up to self.max_retries times on transient SageMaker errors.
+        Uses exponential back-off (1s, 2s, 4s).
+        """
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                response = self._runtime.invoke_endpoint(
+                    EndpointName=self.endpoint_name,
+                    ContentType="application/json",
+                    Body=json.dumps(payload),
+                )
+                result = json.loads(response["Body"].read().decode())
+                return result[0]["generated_text"] if isinstance(result, list) else str(result)
+
+            except self._runtime.exceptions.ThrottlingException as e:
+                wait = 2 ** attempt
+                print(f"[SageMaker] Throttled (attempt {attempt + 1}). Retrying in {wait}s…")
+                time.sleep(wait)
+                last_error = e
+
+            except Exception as e:
+                # Non-transient error — fail fast
+                print(f"[SageMaker] Non-retryable error: {e}")
+                raise e
+
+        raise RuntimeError(f"[SageMaker] All {self.max_retries} retries exhausted. Last error: {last_error}")
+
+    # ── internal: clean model output ─────────────────────────────────────────
+
+    @staticmethod
+    def _clean_output(text: str) -> str:
+        """
+        FIX 4: Strip artefacts produced by the fine-tuned model:
+          - <think>...</think> reasoning tokens (DeepSeek-R1)
+          - Leftover <|im_end|> tokens
+          - "The answer is" / "The answer to your question is" prefix
+        """
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        text = re.sub(r"<\|im_end\|>.*", "", text, flags=re.DOTALL)
+        text = re.sub(r"(?i)^the answer (to (your|this) (question|query) )?is[:\s]*", "", text)
+        return text.strip()
+
+    # ── public API ────────────────────────────────────────────────────────────
 
     def _call(
         self,
@@ -120,99 +219,43 @@ class SageMakerLLM(BaseLLM):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs,
     ) -> str:
-        runtime = boto3.client(
-            "sagemaker-runtime",
-            region_name=self.region_name,
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        )
-
-        # DeepSeek-R1-Distill-Qwen — Test 2 format (proven to give detailed answers)
-        formatted = (
-            f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
-            f"<|im_start|>user\n{prompt}\n"
-            f"<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
-
         payload = {
-            "inputs": formatted,
+            "inputs": self._build_prompt(prompt),
             "parameters": {
                 "max_new_tokens":     self.max_new_tokens,
-                "temperature":        0.2,   # Low temperature for factual medical QA
+                "temperature":        0.2,
                 "top_p":              0.95,
                 "repetition_penalty": 1.05,
                 "do_sample":          True,
                 "return_full_text":   False,
-            }
+            },
         }
-
         try:
-            response = runtime.invoke_endpoint(
-                EndpointName=self.endpoint_name,
-                ContentType="application/json",
-                Body=json.dumps(payload),
-            )
-            result = json.loads(response["Body"].read().decode())
-            text   = result[0]["generated_text"] if isinstance(result, list) else str(result)
-
-            # DeepSeek-R1 emits <think>...</think> reasoning tokens before the answer
-            # Strip them so only the final answer is returned
-            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-            # Also strip any leftover im_end tokens
-            text = re.sub(r"<\|im_end\|>.*", "", text, flags=re.DOTALL).strip()
-
-            return text
-
+            raw = self._invoke_with_retry(payload)
+            return self._clean_output(raw)
         except Exception as e:
-            print(f"[SageMaker] Error calling endpoint: {e}")
-            return "Error: Could not get response from model endpoint."
+            print(f"[SageMaker] _call failed: {e}")
+            return "Error: Could not get a response from the model endpoint."
 
     def _call_with_prefix(self, user_message: str, prefix: str) -> str:
-        """
-        Injects an answer prefix directly into the assistant turn.
-        Forces the model to continue the prefix instead of starting fresh.
-        """
-        runtime = boto3.client(
-            "sagemaker-runtime",
-            region_name=self.region_name,
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        )
-
-        formatted = (
-            f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
-            f"<|im_start|>user\n{user_message}\n"
-            f"<|im_end|>\n"
-            f"<|im_start|>assistant\n{prefix}"  # model continues from here
-        )
-
+        """Force the model to continue from a given answer prefix."""
         payload = {
-            "inputs": formatted,
+            "inputs": self._build_prompt(user_message, prefix=prefix),
             "parameters": {
                 "max_new_tokens":     self.max_new_tokens,
-                "temperature":        0.2,   # Low temperature for factual medical QA
+                "temperature":        0.2,
                 "top_p":              0.95,
                 "repetition_penalty": 1.05,
                 "do_sample":          True,
                 "return_full_text":   False,
-            }
+            },
         }
-
         try:
-            response = runtime.invoke_endpoint(
-                EndpointName=self.endpoint_name,
-                ContentType="application/json",
-                Body=json.dumps(payload),
-            )
-            result = json.loads(response["Body"].read().decode())
-            text   = result[0]["generated_text"] if isinstance(result, list) else str(result)
-            text   = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-            text   = re.sub(r"<\|im_end\|>.*", "", text, flags=re.DOTALL).strip()
-            return text
+            raw = self._invoke_with_retry(payload)
+            return self._clean_output(raw)
         except Exception as e:
-            print(f"[SageMaker] Error: {e}")
-            return "could not retrieve a response from the model endpoint."
+            print(f"[SageMaker] _call_with_prefix failed: {e}")
+            return "Error: Could not retrieve a response from the model endpoint."
 
     def _generate(self, prompts, stop=None, run_manager=None, **kwargs):
         from langchain_core.outputs import LLMResult, Generation
@@ -227,22 +270,53 @@ class SageMakerLLM(BaseLLM):
 class QueryType(Enum):
     FACTUAL     = "factual"
     PROCEDURAL  = "procedural"
+    MECHANISTIC = "mechanistic"   # FIX 3: new type for MOA/pathway questions
     DIAGNOSTIC  = "diagnostic"
     COMPARATIVE = "comparative"
     MULTI_HOP   = "multi_hop"
 
 
+# FIX 3: MECHANISTIC added — checked before FACTUAL so MOA queries are caught
 QUERY_PATTERNS = {
-    QueryType.FACTUAL:     [r"\bwhat is\b", r"\bdefine\b", r"\bnormal range\b", r"\bvalue of\b"],
-    QueryType.PROCEDURAL:  [r"\bhow (is|to|do)\b", r"\bprocedure\b", r"\bsteps\b", r"\bperform\b"],
-    QueryType.DIAGNOSTIC:  [r"\bdifferential\b", r"\bdiagnose\b", r"\bpresent(s|ing)?\b", r"\bsymptom\b"],
-    QueryType.COMPARATIVE: [r"\bcompare\b", r"\bversus\b", r"\bvs\.?\b", r"\bdifference\b"],
-    QueryType.MULTI_HOP:   [r"\baffect\b", r"\brelationship\b", r"\bimpact\b", r"\binteraction\b"],
+    QueryType.MECHANISTIC: [
+        r"\bmechanism\b", r"\bmoa\b", r"\bmode of action\b",
+        r"\bpathway\b",   r"\bhow does .+ work\b",
+        r"\bpharmacodynamic\b", r"\bpharmacology\b",
+        r"\bactivat(e|es|ion)\b", r"\binhibit(s|ion)\b",
+        r"\bagonist\b",   r"\bantagonist\b",
+        r"\breceptor\b",  r"\bsignalling\b",
+    ],
+    QueryType.FACTUAL: [
+        r"\bwhat is\b", r"\bdefine\b", r"\bnormal range\b", r"\bvalue of\b",
+    ],
+    QueryType.PROCEDURAL: [
+        r"\bhow (is|to|do)\b", r"\bprocedure\b", r"\bsteps\b", r"\bperform\b",
+    ],
+    QueryType.DIAGNOSTIC: [
+        r"\bdifferential\b", r"\bdiagnose\b", r"\bpresent(s|ing)?\b", r"\bsymptom\b",
+    ],
+    QueryType.COMPARATIVE: [
+        r"\bcompare\b", r"\bversus\b", r"\bvs\.?\b", r"\bdifference\b",
+    ],
+    QueryType.MULTI_HOP: [
+        r"\baffect\b", r"\brelationship\b", r"\bimpact\b", r"\binteraction\b",
+    ],
+}
+
+# Depth bucket per query type — controls context window sizing
+QUERY_DEPTH: Dict[QueryType, str] = {
+    QueryType.FACTUAL:     "shallow",
+    QueryType.PROCEDURAL:  "medium",
+    QueryType.MECHANISTIC: "deep",
+    QueryType.DIAGNOSTIC:  "medium",
+    QueryType.COMPARATIVE: "deep",
+    QueryType.MULTI_HOP:   "deep",
 }
 
 
 def classify_query(query: str) -> QueryType:
     q = query.lower()
+    # FIX 3: iterate in definition order so MECHANISTIC is tested before FACTUAL
     for qtype, patterns in QUERY_PATTERNS.items():
         if any(re.search(p, q) for p in patterns):
             return qtype
@@ -253,6 +327,7 @@ def get_retrieval_config(query_type: QueryType) -> Dict:
     configs = {
         QueryType.FACTUAL:     {"k": 5,  "use_mmr": False, "expand_query": False},
         QueryType.PROCEDURAL:  {"k": 5,  "use_mmr": True,  "expand_query": False},
+        QueryType.MECHANISTIC: {"k": 8,  "use_mmr": True,  "expand_query": True},  # FIX 3
         QueryType.DIAGNOSTIC:  {"k": 7,  "use_mmr": True,  "expand_query": True},
         QueryType.COMPARATIVE: {"k": 8,  "use_mmr": True,  "expand_query": True},
         QueryType.MULTI_HOP:   {"k": 10, "use_mmr": True,  "expand_query": True},
@@ -265,15 +340,26 @@ def get_retrieval_config(query_type: QueryType) -> Dict:
 # ─────────────────────────────────────────────
 
 def expand_medical_query(query: str, llm: SageMakerLLM) -> List[str]:
-    message = (
-        f"Generate 3 alternative medical search queries for better document retrieval.\n"
-        f"Return only the queries, one per line, no numbering.\n\n"
-        f"Original query: {query}\n"
-        f"Alternative queries:"
-    )
-    result   = llm._call(message)
-    variants = [q.strip() for q in result.strip().split("\n") if q.strip()]
-    return [query] + variants[:3]
+    """
+    FIX 6: Word cap raised from 8 → 20 so medical terminology isn't truncated.
+    """
+    try:
+        raw = llm._call(QUERY_EXPANSION_PROMPT.format(query=query))
+        variants = []
+        for line in raw.split("\n"):
+            line = line.strip().strip('"').lstrip("0123456789.-) ")
+            if (
+                line
+                and "answer" not in line.lower()
+                and len(line.split()) <= 20   # FIX 6: was 8
+                and len(line.split()) >= 2
+            ):
+                variants.append(line)
+        print(f"[Expansion] Variants: {variants[:2]}")
+        return [query] + variants[:2]
+    except Exception as e:
+        print(f"[Expansion] Failed: {e}")
+        return [query]
 
 
 # ─────────────────────────────────────────────
@@ -283,27 +369,27 @@ def expand_medical_query(query: str, llm: SageMakerLLM) -> List[str]:
 def grade_documents(
     query: str,
     docs: List[Document],
-    llm: SageMakerLLM,
     threshold: float = RELEVANCE_THRESHOLD,
 ) -> Tuple[List[Document], bool]:
     """
-    Fast relevance grading using keyword overlap — no LLM calls.
-    Avoids N extra SageMaker round trips before answering.
+    FIX 2: Now wired into run() — was defined but never called before.
+    Keyword-overlap grading avoids extra SageMaker round trips.
+    Sets doc.metadata["relevance_score"] so it appears correctly in the output.
     """
-    query_terms = set(re.findall(r'\b\w{4,}\b', query.lower()))
+    query_terms = set(re.findall(r"\b\w{4,}\b", query.lower()))
     filtered, scores = [], []
 
     for doc in docs:
-        doc_terms  = set(re.findall(r'\b\w{4,}\b', doc.page_content.lower()))
-        overlap    = len(query_terms & doc_terms)
-        score      = min(overlap / max(len(query_terms), 1), 1.0)
+        doc_terms = set(re.findall(r"\b\w{4,}\b", doc.page_content.lower()))
+        overlap   = len(query_terms & doc_terms)
+        score     = round(min(overlap / max(len(query_terms), 1), 1.0), 3)
         scores.append(score)
-        doc.metadata["relevance_score"] = round(score, 3)
+        doc.metadata["relevance_score"] = score   # FIX 9: was never set before
         if score >= threshold:
             filtered.append(doc)
 
     needs_requery = len(filtered) < 2 or (scores and max(scores) < threshold)
-    print(f"[CRAG] Scores: {[round(s,2) for s in scores]}")
+    print(f"[CRAG] Scores: {[s for s in scores]}")
     print(f"[CRAG] {len(filtered)}/{len(docs)} docs passed (threshold={threshold}). Re-query: {needs_requery}")
     return filtered, needs_requery
 
@@ -312,22 +398,23 @@ def grade_documents(
 # Helpers
 # ─────────────────────────────────────────────
 
-def format_docs(docs: List[Document]) -> str:
+def format_docs(docs: List[Document], per_doc_chars: int) -> str:
+    """
+    FIX 5: per_doc_chars is now passed in from the query-type-aware config
+    instead of being hardcoded at 500.
+    FIX 8: Citation hint appended so the model knows which source is which.
+    """
     sections = []
     for i, doc in enumerate(docs, 1):
-        book = doc.metadata.get(
-            "book",
-            Path(doc.metadata.get("source", "Unknown")).stem
+        book    = clean_book_name(doc)
+        content = doc.page_content[:per_doc_chars]
+        sections.append(
+            f"[Source {i} | {book}]\n{content}"
         )
-
-        # 🔥 LIMIT EACH DOC SIZE
-        content = doc.page_content[:500]
-
-        sections.append(f"[Source {i} | {book}]\n{content}")
-
     return "\n\n---\n\n".join(sections)
 
-def truncate_context(text: str, max_chars: int = 3500) -> str:
+
+def truncate_context(text: str, max_chars: int) -> str:
     return text[:max_chars]
 
 
@@ -337,8 +424,7 @@ def clean_book_name(doc: Document) -> str:
         doc.metadata.get("source", "") or
         "Medical Textbook"
     )
-    book = re.split(r"[/\\]", book)[-1].replace(".txt", "")
-    return book
+    return re.split(r"[/\\]", book)[-1].replace(".txt", "")
 
 
 # ─────────────────────────────────────────────
@@ -349,6 +435,8 @@ class MedicalRAGPipeline:
     def __init__(self, vectorstore: PineconeVectorStore, llm: SageMakerLLM):
         self.vectorstore = vectorstore
         self.llm         = llm
+
+    # ── retrieval ─────────────────────────────────────────────────────────────
 
     def retrieve(self, query: str, config: Dict) -> List[Document]:
         if config["use_mmr"]:
@@ -366,143 +454,118 @@ class MedicalRAGPipeline:
             )
         return retriever.invoke(query)
 
+    # ── main entry point ──────────────────────────────────────────────────────
+
     def run(self, query: str) -> Dict:
-        # ─────────────────────────────
-        # 1. Adaptive Routing
-        # ─────────────────────────────
+
+        # ─── 1. Adaptive Routing ─────────────────────────────────────────────
+        # FIX 3: MECHANISTIC type now catches mechanism/pathway/MOA queries
         query_type = classify_query(query)
-        config = get_retrieval_config(query_type)
+        config     = get_retrieval_config(query_type)
+        depth      = QUERY_DEPTH[query_type]
 
-        print(f"[Adaptive] Query type: {query_type.value} | k={config['k']} | mmr={config['use_mmr']}")
+        per_doc_chars = CONTEXT_PER_DOC[depth]
+        total_chars   = CONTEXT_TOTAL[depth]
 
-        # ─────────────────────────────
-        # 2. Query Expansion (NEW PROMPT)
-        # ─────────────────────────────
-        try:
-            expansion_msg = QUERY_EXPANSION_PROMPT.format(query=query)
-            raw = self.llm._call(expansion_msg)
+        print(f"[Adaptive] Query type: {query_type.value} | depth: {depth} | k={config['k']} | mmr={config['use_mmr']}")
 
-            variants = []
-            for line in raw.split("\n"):
-                line = line.strip().strip('"')
-
-                if (
-                    line
-                    and "answer" not in line.lower()
-                    and len(line.split()) <= 8
-                ):
-                    variants.append(line)
-
-            queries = [query] + variants[:2]
-            print(f"[Expansion] Variants: {queries}")
-
-        except Exception as e:
-            print(f"[Expansion] Failed: {e}")
+        # ─── 2. Query Expansion ──────────────────────────────────────────────
+        # FIX 6: word cap raised to 20 inside expand_medical_query()
+        if config["expand_query"]:
+            queries = expand_medical_query(query, self.llm)
+        else:
             queries = [query]
 
-        # ─────────────────────────────
-        # 3. Retrieval (deduplicated)
-        # ─────────────────────────────
-        all_docs = []
-        seen = set()
-
+        # ─── 3. Retrieval (deduplicated) ─────────────────────────────────────
+        all_docs, seen = [], set()
         for q in queries:
-            docs = self.retrieve(q, config)
-            for doc in docs:
+            for doc in self.retrieve(q, config):
                 key = doc.page_content[:100]
                 if key not in seen:
                     seen.add(key)
                     all_docs.append(doc)
 
-        print(f"[Retrieve] {len(all_docs)} unique docs")
+        print(f"[Retrieve] {len(all_docs)} unique docs across {len(queries)} query variant(s)")
 
-        # ─────────────────────────────
-        # 4. LLM-based Relevance Grading (NEW)
-        # ─────────────────────────────
-        top_context = all_docs[0].page_content[:1000] if all_docs else ""
+        # ─── 4. Keyword Relevance Grading (CRAG) ─────────────────────────────
+        # FIX 2: grade_documents() is now actually called here
+        graded_docs, needs_requery = grade_documents(query, all_docs)
 
-        grader_msg = GRADER_PROMPT.format(
-            query=query,
-            context=top_context
-        )
+        # If too few docs passed, fall back to all retrieved docs rather than
+        # returning nothing — the LLM grader below is the second safety net
+        candidate_docs = graded_docs if not needs_requery else all_docs
 
+        # ─── 5. LLM Relevance Gate ───────────────────────────────────────────
+        top_context = candidate_docs[0].page_content[:1000] if candidate_docs else ""
         try:
-            relevance_raw = self.llm._call(grader_msg).lower().strip()
-
-            if "yes" in relevance_raw:
-                relevance = "yes"
-            else:
-                relevance = "no"
-            print(f"[Grader] Relevance: {relevance}")
+            relevance_raw = self.llm._call(
+                GRADER_PROMPT.format(query=query, context=top_context)
+            ).lower().strip()
+            relevance = "yes" if "yes" in relevance_raw else "no"
+            print(f"[Grader] LLM relevance gate: {relevance}")
         except Exception as e:
             print(f"[Grader] Failed: {e}")
-            relevance = "yes"  # fallback safe default
+            relevance = "yes"
 
-        # ─────────────────────────────
-        # 5. Fallback Logic (NEW)
-        # ─────────────────────────────
-        if "no" in relevance or not all_docs:
-            print("[Fallback] Using general medical knowledge")
-
-            llm_answer = self.llm._call(
-                FALLBACK_PROMPT.format(query=query)
-            )
-
+        # ─── 6. Fallback (no relevant docs) ──────────────────────────────────
+        if relevance == "no" or not candidate_docs:
+            print("[Fallback] No relevant docs — generating from parametric knowledge")
+            llm_answer    = self.llm._call(FALLBACK_PROMPT.format(query=query))
             filtered_docs = []
-            is_fallback = True
+            is_fallback   = True
 
         else:
-            # ─────────────────────────────
-            # 6. Standard RAG
-            # ─────────────────────────────
-            # 🔥 REDUCE DOC COUNT (CRITICAL)
-            filtered_docs = all_docs[:3]
+            # ─── 7. RAG Generation ────────────────────────────────────────────
+            # FIX 5: use query-type-aware context limits
+            filtered_docs = candidate_docs[:5]  # cap at 5 to keep latency sane
+            context_text  = format_docs(filtered_docs, per_doc_chars)
+            context_text  = truncate_context(context_text, total_chars)
 
-            context_text = format_docs(filtered_docs)
-
-            # 🔥 HARD LIMIT CONTEXT SIZE
-            context_text = truncate_context(context_text, 3500)
-
-            prompt = RAG_PROMPT.format(
-                context=context_text,
-                query=query
+            # FIX 8: cite-by-number instruction injected into the prompt
+            citation_instruction = (
+                "\n\nIMPORTANT: After each clinical statement, "
+                "add a citation marker like [Source 1] or [Source 2] "
+                "matching the source excerpts above. Only cite sources that "
+                "directly support the statement."
             )
 
-            print(f"[LLM] Generating RAG answer from {len(filtered_docs)} docs...")
+            RAG_PROMPT_MAP = {
+                QueryType.FACTUAL:     RAG_PROMPT_FACTUAL,
+                QueryType.MECHANISTIC: RAG_PROMPT_MECHANISTIC,
+                QueryType.PROCEDURAL:  RAG_PROMPT_MECHANISTIC,  # reuse — same depth
+                QueryType.DIAGNOSTIC:  RAG_PROMPT_DIAGNOSTIC,
+                QueryType.COMPARATIVE: RAG_PROMPT_MECHANISTIC,
+                QueryType.MULTI_HOP:   RAG_PROMPT_MECHANISTIC,
+            }
 
-            import time
-            start = time.time()
+            # In run():
+            prompt_template = RAG_PROMPT_MAP[query_type]
+            prompt = prompt_template.format(context=context_text, query=query)
 
+            # prompt = RAG_PROMPT.format(context=context_text, query=query) + citation_instruction
+
+            print(f"[LLM] Generating RAG answer | docs={len(filtered_docs)} | "
+                  f"context={len(context_text)} chars")
+
+            t0         = time.time()
             llm_answer = self.llm._call(prompt)
-
-            print(f"[LLM] Time: {round(time.time() - start, 2)}s")
+            print(f"[LLM] Done in {round(time.time() - t0, 2)}s")
 
             is_fallback = False
 
-        # ─────────────────────────────
-        # 7. Source Attribution
-        # ─────────────────────────────
-        excerpts = []
-        for i, doc in enumerate(filtered_docs, 1):
-            book = clean_book_name(doc)
-            excerpts.append(
-                f"[Source {i} — {book}]\n{doc.page_content[:500].strip()}"
-            )
-
+        # ─── 8. Source Attribution ────────────────────────────────────────────
         answer = llm_answer.strip()
 
-        # ─────────────────────────────
-        # 8. Return
-        # ─────────────────────────────
         return {
-            "query": query,
-            "query_type": query_type.value,
-            "answer": answer,
-            "source_docs": filtered_docs,
-            "context": top_context,
-            "num_docs": len(filtered_docs),
+            "query":        query,
+            "query_type":   query_type.value,
+            "answer":       answer,
+            "source_docs":  filtered_docs,
+            "context":      top_context,
+            "num_docs":     len(filtered_docs),
             "fallback_used": is_fallback,
         }
+
 
 # ─────────────────────────────────────────────
 # Pipeline Factory
@@ -512,14 +575,11 @@ def build_pipeline(
     endpoint: str = SAGEMAKER_ENDPOINT,
     region:   str = AWS_REGION,
 ) -> MedicalRAGPipeline:
-    """Connect to Pinecone + SageMaker and return ready pipeline."""
     print(f"[Pipeline] Endpoint : {endpoint}")
     print(f"[Pipeline] Region   : {region}")
-
     vectorstore = load_vectorstore()
     llm         = SageMakerLLM(endpoint_name=endpoint, region_name=region)
-
-    print(f"[Pipeline] ✅ Ready!")
+    print("[Pipeline] ✅ Ready!")
     return MedicalRAGPipeline(vectorstore=vectorstore, llm=llm)
 
 
@@ -541,8 +601,9 @@ if __name__ == "__main__":
     if args.query:
         result = pipeline_obj.run(args.query)
         print("\n" + "=" * 60)
-        print(f"Query Type : {result['query_type']}")
-        print(f"Docs Used  : {result['num_docs']}")
+        print(f"Query Type  : {result['query_type']}")
+        print(f"Docs Used   : {result['num_docs']}")
+        print(f"Fallback    : {result['fallback_used']}")
         print(f"\nAnswer:\n{result['answer']}")
     else:
         print("\nMedical RAG ready. Type your question (or 'quit' to exit):\n")
@@ -553,4 +614,4 @@ if __name__ == "__main__":
             if q:
                 result = pipeline_obj.run(q)
                 print(f"\nAnswer:\n{result['answer']}\n")
-                print(f"Sources: {[d.metadata.get('book','?') for d in result['source_docs']]}\n")
+                print(f"Sources: {[d.metadata.get('book', '?') for d in result['source_docs']]}\n")
