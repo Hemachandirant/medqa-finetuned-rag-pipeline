@@ -32,7 +32,13 @@ from langchain_core.language_models.llms import BaseLLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from pydantic import Field
 
-
+from prompts.medical_prompts import (
+    SYSTEM_PROMPT,
+    RAG_PROMPT,
+    QUERY_EXPANSION_PROMPT,
+    GRADER_PROMPT,
+    FALLBACK_PROMPT
+)
 # ─────────────────────────────────────────────
 # Configuration (load from .env)
 # ─────────────────────────────────────────────
@@ -309,10 +315,20 @@ def grade_documents(
 def format_docs(docs: List[Document]) -> str:
     sections = []
     for i, doc in enumerate(docs, 1):
-        book  = doc.metadata.get("book", Path(doc.metadata.get("source", "Unknown")).stem)
-        score = doc.metadata.get("relevance_score", "N/A")
-        sections.append(f"[Source {i} | {book} | relevance={score}]\n{doc.page_content}")
+        book = doc.metadata.get(
+            "book",
+            Path(doc.metadata.get("source", "Unknown")).stem
+        )
+
+        # 🔥 LIMIT EACH DOC SIZE
+        content = doc.page_content[:500]
+
+        sections.append(f"[Source {i} | {book}]\n{content}")
+
     return "\n\n---\n\n".join(sections)
+
+def truncate_context(text: str, max_chars: int = 3500) -> str:
+    return text[:max_chars]
 
 
 def clean_book_name(doc: Document) -> str:
@@ -351,97 +367,142 @@ class MedicalRAGPipeline:
         return retriever.invoke(query)
 
     def run(self, query: str) -> Dict:
-        # Step 1: Adaptive routing
+        # ─────────────────────────────
+        # 1. Adaptive Routing
+        # ─────────────────────────────
         query_type = classify_query(query)
-        config     = get_retrieval_config(query_type)
+        config = get_retrieval_config(query_type)
+
         print(f"[Adaptive] Query type: {query_type.value} | k={config['k']} | mmr={config['use_mmr']}")
 
-        # Step 2: Query expansion (only for complex queries)
-        queries = [query]
-        if config["expand_query"]:
-            try:
-                queries = expand_medical_query(query, self.llm)
-                print(f"[Expansion] Generated {len(queries)} query variants")
-            except Exception as e:
-                print(f"[Expansion] Skipped: {e}")
-                queries = [query]
+        # ─────────────────────────────
+        # 2. Query Expansion (NEW PROMPT)
+        # ─────────────────────────────
+        try:
+            expansion_msg = QUERY_EXPANSION_PROMPT.format(query=query)
+            raw = self.llm._call(expansion_msg)
 
-        # Step 3: Retrieve + deduplicate across all query variants
-        all_docs, seen = [], set()
+            variants = []
+            for line in raw.split("\n"):
+                line = line.strip().strip('"')
+
+                if (
+                    line
+                    and "answer" not in line.lower()
+                    and len(line.split()) <= 8
+                ):
+                    variants.append(line)
+
+            queries = [query] + variants[:2]
+            print(f"[Expansion] Variants: {queries}")
+
+        except Exception as e:
+            print(f"[Expansion] Failed: {e}")
+            queries = [query]
+
+        # ─────────────────────────────
+        # 3. Retrieval (deduplicated)
+        # ─────────────────────────────
+        all_docs = []
+        seen = set()
+
         for q in queries:
-            for doc in self.retrieve(q, config):
+            docs = self.retrieve(q, config)
+            for doc in docs:
                 key = doc.page_content[:100]
                 if key not in seen:
                     seen.add(key)
                     all_docs.append(doc)
-        print(f"[Retrieve] {len(all_docs)} unique docs retrieved")
 
-        # Step 4: Corrective RAG — grade relevance
-        filtered_docs, needs_requery = grade_documents(query, all_docs, self.llm)
+        print(f"[Retrieve] {len(all_docs)} unique docs")
 
-        # Step 5: Re-retrieve with expanded k if quality was low
-        if needs_requery:
-            print("[CRAG] Re-retrieving with expanded k...")
-            fallback = self.retrieve(query, {**config, "k": TOP_K_EXPANDED, "use_mmr": True})
-            filtered_docs, _ = grade_documents(
-                query, fallback, self.llm, RELEVANCE_THRESHOLD * 0.7
-            )
+        # ─────────────────────────────
+        # 4. LLM-based Relevance Grading (NEW)
+        # ─────────────────────────────
+        top_context = all_docs[0].page_content[:1000] if all_docs else ""
 
-        # Fallback: use top raw docs if grader filtered everything
-        if not filtered_docs:
-            print("[CRAG] Fallback: using top 3 ungraded docs")
-            filtered_docs = all_docs[:3]
-
-        # Step 6: LLM answer synthesis from retrieved context
-        MAX_CONTEXT_CHARS = 6000
-        context = format_docs(filtered_docs)
-        context = context[:MAX_CONTEXT_CHARS]
-
-        prompt = (
-            f"You are a medical expert.\n\n"
-            f"Answer the question using ONLY the context below.\n\n"
-            f"Instructions:\n"
-            f"- Give a clear summary first\n"
-            f"- Then detailed explanation\n"
-            f"- Include treatment steps\n"
-            f"- Mention drug names clearly\n"
-            f"- Do not hallucinate\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question:\n{query}\n\n"
-            f"Answer:"
+        grader_msg = GRADER_PROMPT.format(
+            query=query,
+            context=top_context
         )
 
-        print(f"[LLM] Generating answer from {len(filtered_docs)} docs...")
-        import time
-        start = time.time()
-        llm_answer = self.llm._call(prompt)
-        print(f"[LLM] Time: {round(time.time() - start, 2)}s")
+        try:
+            relevance_raw = self.llm._call(grader_msg).lower().strip()
 
-        # Fallback if model gives a weak/empty answer
-        if len(llm_answer.strip()) < 50:
-            print("[LLM] Weak answer → fallback to raw context")
-            llm_answer = context[:1000]
+            if "yes" in relevance_raw:
+                relevance = "yes"
+            else:
+                relevance = "no"
+            print(f"[Grader] Relevance: {relevance}")
+        except Exception as e:
+            print(f"[Grader] Failed: {e}")
+            relevance = "yes"  # fallback safe default
 
-        # Append source attribution after the LLM answer
-        excerpts = []
-        for i, doc in enumerate(filtered_docs, 1):
-            book  = clean_book_name(doc)
-            score = doc.metadata.get("relevance_score", "N/A")
-            excerpts.append(
-                f"[Source {i} — {book} | relevance={score}]\n{doc.page_content[:600].strip()}"
+        # ─────────────────────────────
+        # 5. Fallback Logic (NEW)
+        # ─────────────────────────────
+        if "no" in relevance or not all_docs:
+            print("[Fallback] Using general medical knowledge")
+
+            llm_answer = self.llm._call(
+                FALLBACK_PROMPT.format(query=query)
             )
 
-        answer = llm_answer + "\n\n--- Sources ---\n\n" + "\n\n".join(excerpts)
+            filtered_docs = []
+            is_fallback = True
 
+        else:
+            # ─────────────────────────────
+            # 6. Standard RAG
+            # ─────────────────────────────
+            # 🔥 REDUCE DOC COUNT (CRITICAL)
+            filtered_docs = all_docs[:3]
+
+            context_text = format_docs(filtered_docs)
+
+            # 🔥 HARD LIMIT CONTEXT SIZE
+            context_text = truncate_context(context_text, 3500)
+
+            prompt = RAG_PROMPT.format(
+                context=context_text,
+                query=query
+            )
+
+            print(f"[LLM] Generating RAG answer from {len(filtered_docs)} docs...")
+
+            import time
+            start = time.time()
+
+            llm_answer = self.llm._call(prompt)
+
+            print(f"[LLM] Time: {round(time.time() - start, 2)}s")
+
+            is_fallback = False
+
+        # ─────────────────────────────
+        # 7. Source Attribution
+        # ─────────────────────────────
+        excerpts = []
+        for i, doc in enumerate(filtered_docs, 1):
+            book = clean_book_name(doc)
+            excerpts.append(
+                f"[Source {i} — {book}]\n{doc.page_content[:500].strip()}"
+            )
+
+        answer = llm_answer.strip()
+
+        # ─────────────────────────────
+        # 8. Return
+        # ─────────────────────────────
         return {
-            "query":       query,
-            "query_type":  query_type.value,
-            "answer":      answer,
+            "query": query,
+            "query_type": query_type.value,
+            "answer": answer,
             "source_docs": filtered_docs,
-            "context":     context,
-            "num_docs":    len(filtered_docs),
+            "context": top_context,
+            "num_docs": len(filtered_docs),
+            "fallback_used": is_fallback,
         }
-
 
 # ─────────────────────────────────────────────
 # Pipeline Factory
